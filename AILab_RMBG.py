@@ -30,7 +30,10 @@ import importlib.util
 from transformers import AutoModelForImageSegmentation
 import cv2
 import types
-
+import concurrent.futures
+from PIL import Image, ImageFilter
+import numpy as np
+import torch
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 folder_paths.add_model_folder_path("rmbg", os.path.join(folder_paths.models_dir, "RMBG"))
@@ -554,15 +557,15 @@ class RMBG:
     RETURN_TYPES = ("IMAGE", "MASK", "IMAGE")
     RETURN_NAMES = ("IMAGE", "MASK", "MASK_IMAGE")
     FUNCTION = "process_image"
-    CATEGORY = "🧪AILab/🧽RMBG"
+    CATEGORY = "ðŸ§ªAILab/ðŸ§½RMBG"
 
     def process_image(self, image, model, **params):
         try:
             processed_images = []
             processed_masks = []
-            
+    
             model_instance = self.models[model]
-            
+    
             cache_status, message = model_instance.check_model_cache(model)
             if not cache_status:
                 print(f"Cache check: {message}")
@@ -571,24 +574,24 @@ class RMBG:
                 if not download_status:
                     handle_model_error(download_message)
                 print("Model files downloaded successfully")
-            
-            for img in image:
+            def process_single(idx, img):
+                """Process a single image and return (index, processed_image, processed_mask)."""
                 mask = model_instance.process_image(img, model, params)
-                
+    
                 if isinstance(mask, list):
                     masks = [m.convert("L") for m in mask if isinstance(m, Image.Image)]
                     mask = masks[0] if masks else None
                 elif isinstance(mask, Image.Image):
                     mask = mask.convert("L")
-
+    
                 mask_tensor = pil2tensor(mask)
                 mask_tensor = mask_tensor * (1 + (1 - params["sensitivity"]))
                 mask_tensor = torch.clamp(mask_tensor, 0, 1)
                 mask = tensor2pil(mask_tensor)
-                
+    
                 if params["mask_blur"] > 0:
                     mask = mask.filter(ImageFilter.GaussianBlur(radius=params["mask_blur"]))
-                
+    
                 if params["mask_offset"] != 0:
                     if params["mask_offset"] > 0:
                         for _ in range(params["mask_offset"]):
@@ -596,15 +599,15 @@ class RMBG:
                     else:
                         for _ in range(-params["mask_offset"]):
                             mask = mask.filter(ImageFilter.MinFilter(3))
-                
+    
                 if params["invert_output"]:
                     mask = Image.fromarray(255 - np.array(mask))
-
+    
                 img_tensor = torch.from_numpy(np.array(tensor2pil(img))).permute(2, 0, 1).unsqueeze(0) / 255.0
                 mask_tensor = torch.from_numpy(np.array(mask)).unsqueeze(0).unsqueeze(0) / 255.0
-
+    
                 orig_image = tensor2pil(img)
-                
+    
                 if params.get("refine_foreground", False):
                     refined_fg = refine_foreground(img_tensor, mask_tensor)
                     refined_fg = tensor2pil(refined_fg[0].permute(1, 2, 0))
@@ -614,7 +617,7 @@ class RMBG:
                     orig_rgba = orig_image.convert("RGBA")
                     r, g, b, _ = orig_rgba.split()
                     foreground = Image.merge('RGBA', (r, g, b, mask))
-
+    
                 if params["background"] == "Color":
                     def hex_to_rgba(hex_color):
                         hex_color = hex_color.lstrip('#')
@@ -622,35 +625,47 @@ class RMBG:
                             r, g, b = int(hex_color[0:2], 16), int(hex_color[2:4], 16), int(hex_color[4:6], 16)
                             a = 255
                         elif len(hex_color) == 8:
-                            r, g, b, a = int(hex_color[0:2], 16), int(hex_color[2:4], 16), int(hex_color[4:6], 16), int(hex_color[6:8], 16)
+                            r, g, b, a = (int(hex_color[0:2], 16), int(hex_color[2:4], 16),
+                                          int(hex_color[4:6], 16), int(hex_color[6:8], 16))
                         else:
                             raise ValueError("Invalid color format")
                         return (r, g, b, a)
+    
                     background_color = params.get("background_color", "#222222")
                     rgba = hex_to_rgba(background_color)
                     bg_image = Image.new('RGBA', orig_image.size, rgba)
                     composite_image = Image.alpha_composite(bg_image, foreground)
-                    processed_images.append(pil2tensor(composite_image.convert("RGB")))
+                    return idx, pil2tensor(composite_image.convert("RGB")), pil2tensor(mask)
                 else:
-                    processed_images.append(pil2tensor(foreground))
-                
-                processed_masks.append(pil2tensor(mask))
+                    return idx, pil2tensor(foreground), pil2tensor(mask)
 
+            # Run parallel
+            results = []
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                futures = [executor.submit(process_single, idx, img) for idx, img in enumerate(image)]
+                for f in concurrent.futures.as_completed(futures):
+                    results.append(f.result())
+    
+            # Sort results by index to preserve order
+            results.sort(key=lambda x: x[0])
+            for _, proc_img, proc_mask in results:
+                processed_images.append(proc_img)
+                processed_masks.append(proc_mask)
+    
+            # Post process masks
             mask_images = []
             for mask_tensor in processed_masks:
                 mask_image = mask_tensor.reshape((-1, 1, mask_tensor.shape[-2], mask_tensor.shape[-1])).movedim(1, -1).expand(-1, -1, -1, 3)
                 mask_images.append(mask_image)
-            
+    
             mask_image_output = torch.cat(mask_images, dim=0)
-            
+    
             return (torch.cat(processed_images, dim=0), torch.cat(processed_masks, dim=0), mask_image_output)
-            
         except Exception as e:
             handle_model_error(f"Error in image processing: {str(e)}")
             empty_mask = torch.zeros((image.shape[0], image.shape[2], image.shape[3]))
             empty_mask_image = empty_mask.reshape((-1, 1, empty_mask.shape[-2], empty_mask.shape[-1])).movedim(1, -1).expand(-1, -1, -1, 3)
             return (image, empty_mask, empty_mask_image)
-
 NODE_CLASS_MAPPINGS = {
     "RMBG": RMBG
 }
