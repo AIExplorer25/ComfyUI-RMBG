@@ -641,7 +641,7 @@ class RMBG:
 
             # Run parallel
             results = []
-            with concurrent.futures.ThreadPoolExecutor() as executor:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=70) as executor:
                 futures = [executor.submit(process_single, idx, img) for idx, img in enumerate(image)]
                 for f in concurrent.futures.as_completed(futures):
                     results.append(f.result())
